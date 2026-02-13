@@ -1,0 +1,7 @@
+version: "0.5"
+
+processes:
+  homarr:
+    command: "docker compose up --pull always --remove-orphans"
+    availability:
+      restart: "on_failure"
