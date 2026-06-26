@@ -9,5 +9,5 @@ package-lock.json
 pnpm-lock.yaml
 **/pnpm-lock.yaml
 pnpm-workspace.yaml
-Dockerfile
-docker-compose.yml
+Containerfile
+compose.yml

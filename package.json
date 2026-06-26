@@ -17,7 +17,7 @@
     "db:studio": "pnpm -F db studio",
     "dev": "pnpm -F nextjs dev",
     "dev:docs": "pnpm -F @homarr/docs dev",
-    "docker:dev": "docker compose -f ./development/development.docker-compose.yml up",
+    "container:dev": "sh -c '${CONTAINER_COMPOSE:-docker compose} -f ./development/development.compose.yml up'",
     "format": "turbo format --continue -- --check",
     "format:fix": "turbo format --continue",
     "lint": "turbo lint --continue",

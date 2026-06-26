@@ -1,0 +1,227 @@
+name: release-image
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sanity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[sanity] release-image workflow starting"
+          echo "[sanity] ref=${GITHUB_REF:-${GITEA_REF:-}} ref_name=${GITHUB_REF_NAME:-${GITEA_REF_NAME:-}}"
+
+      - name: Checkout source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO_FULL="${GITHUB_REPOSITORY:-${GITEA_REPOSITORY:-jeremiealcaraz/dashboard}}"
+          REF_NAME="${GITHUB_REF_NAME:-${GITEA_REF_NAME:-main}}"
+          REPO_URL="http://host.containers.internal:3000/${REPO_FULL}.git"
+
+          echo "[checkout] repo=${REPO_FULL} ref=${REF_NAME}"
+          rm -rf .git
+          git init .
+          git remote add origin "$REPO_URL"
+          git fetch --tags --prune origin
+
+          if git show-ref --verify --quiet "refs/tags/${REF_NAME}"; then
+            git checkout --detach "refs/tags/${REF_NAME}"
+          else
+            git checkout --detach "origin/${REF_NAME}" || git checkout --detach FETCH_HEAD
+          fi
+
+          test -f Containerfile || { echo "Containerfile missing after checkout" >&2; exit 1; }
+          test ! -f Dockerfile || { echo "Root Dockerfile should not be used for Dashboard releases" >&2; exit 1; }
+          echo "[checkout] ok"
+
+      - name: Preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v docker >/dev/null 2>&1 || { echo "docker CLI missing" >&2; exit 1; }
+          docker version >/dev/null 2>&1 || { echo "docker daemon unavailable" >&2; exit 1; }
+          docker buildx version >/dev/null 2>&1 || { echo "docker buildx missing" >&2; exit 1; }
+          test -f Containerfile || { echo "Containerfile missing" >&2; exit 1; }
+          echo "[preflight] ok"
+
+      - name: Build and push image
+        shell: bash
+        env:
+          REGISTRY_HOST: ${{ secrets.REGISTRY_HOST }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          : "${REGISTRY_USERNAME:?Missing REGISTRY_USERNAME secret}"
+          : "${REGISTRY_PASSWORD:?Missing REGISTRY_PASSWORD secret}"
+
+          REPO_FULL="${GITHUB_REPOSITORY:-${GITEA_REPOSITORY:-}}"
+          REF_NAME="${GITHUB_REF_NAME:-${GITEA_REF_NAME:-dev}}"
+          SERVER_URL="${GITHUB_SERVER_URL:-${GITEA_SERVER_URL:-}}"
+
+          : "${REPO_FULL:?Missing repository context}"
+
+          OWNER="${REPO_FULL%%/*}"
+          REPO_NAME="${REPO_FULL##*/}"
+          OWNER_LC="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          APP_LC="$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]')"
+
+          if [ "$APP_LC" != "dashboard" ]; then
+            echo "Unsupported app name for Dashboard release workflow: ${APP_LC}" >&2
+            exit 1
+          fi
+
+          # Prefer the public HTTPS hostname for registry operations.
+          # Local/internal hosts (:3000, dandelion, host.containers.internal) are unreliable in CI jobs.
+          if [ -z "${REGISTRY_HOST:-}" ] || echo "${REGISTRY_HOST}" | grep -Eq '(:3000$|dandelion|host\.containers\.internal)'; then
+            REGISTRY_HOST="gitea.inanga-sirius.ts.net"
+          fi
+
+          IMAGE_REF="${REGISTRY_HOST}/${OWNER_LC}/${APP_LC}:${REF_NAME}"
+          echo "[build] image_ref=${IMAGE_REF}"
+
+          if ! printf '%s' "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" --username "$REGISTRY_USERNAME" --password-stdin; then
+            printf '%s' "$REGISTRY_PASSWORD" | docker login "http://$REGISTRY_HOST" --username "$REGISTRY_USERNAME" --password-stdin
+          fi
+
+          docker buildx build --file Containerfile --tag "$IMAGE_REF" --push --provenance=false --metadata-file build-metadata.json .
+
+          DIGEST="$(python3 -c 'import json,sys; data=json.load(open("build-metadata.json", encoding="utf-8")); digest=data.get("containerimage.digest") or data.get("image.digest"); print(digest or ""); sys.exit(0 if digest else 1)')"
+          test -n "$DIGEST"
+          FULL_REF="${IMAGE_REF}@${DIGEST}"
+
+          {
+            echo "IMAGE_TAG=$REF_NAME"
+            echo "IMAGE_REF=$IMAGE_REF"
+            echo "DIGEST=$DIGEST"
+            echo "FULL_REF=$FULL_REF"
+            echo "REPO_FULL=$REPO_FULL"
+            echo "APP_LC=$APP_LC"
+            echo "SERVER_URL=$SERVER_URL"
+          } > release-image.env
+
+          echo "[build] immutable=${FULL_REF}"
+
+      - name: Update infra and open PR
+        shell: bash
+        env:
+          INFRA_USERNAME: ${{ secrets.INFRA_USERNAME }}
+          INFRA_TOKEN: ${{ secrets.INFRA_TOKEN }}
+          INFRA_BASE_BRANCH: ${{ secrets.INFRA_BASE_BRANCH }}
+          NIX_CONFIG_USERNAME: ${{ secrets.NIX_CONFIG_USERNAME }}
+          NIX_CONFIG_TOKEN: ${{ secrets.NIX_CONFIG_TOKEN }}
+          NIX_CONFIG_BASE_BRANCH: ${{ secrets.NIX_CONFIG_BASE_BRANCH }}
+        run: |
+          set -euo pipefail
+          source ./release-image.env
+
+          INFRA_USERNAME="${INFRA_USERNAME:-${NIX_CONFIG_USERNAME:-}}"
+          INFRA_TOKEN="${INFRA_TOKEN:-${NIX_CONFIG_TOKEN:-}}"
+          INFRA_BASE_BRANCH="${INFRA_BASE_BRANCH:-${NIX_CONFIG_BASE_BRANCH:-main}}"
+
+          : "${INFRA_USERNAME:?Missing INFRA_USERNAME or NIX_CONFIG_USERNAME secret}"
+          : "${INFRA_TOKEN:?Missing INFRA_TOKEN or NIX_CONFIG_TOKEN secret}"
+          : "${SERVER_URL:?Missing server url context}"
+
+          INFRA_REPO="jeremiealcaraz/infra"
+          INFRA_APP="dashboard"
+          IMAGE_ENV_VAR="DASHBOARD_IMAGE"
+          IMAGE_DISPLAY_NAME="Dashboard"
+          BRANCH_NAME="chore/${INFRA_APP}-image-${IMAGE_TAG}"
+          TARGET_FILE="hosts/poppy/apps/${INFRA_APP}/release.conf"
+
+          SERVER_HOST="${SERVER_URL#http://}"
+          SERVER_HOST="${SERVER_HOST#https://}"
+          # Use the public HTTPS endpoint for git/API from inside Actions jobs.
+          # The runner context may expose SERVER_URL as host.containers.internal:3000.
+          if [ -z "${SERVER_HOST:-}" ] || echo "$SERVER_HOST" | grep -Eq '(:3000$|dandelion|host\.containers\.internal)'; then
+            SERVER_HOST="gitea.inanga-sirius.ts.net"
+            SERVER_URL="https://${SERVER_HOST}"
+          fi
+
+          echo "[infra] repo=${INFRA_REPO} branch=${BRANCH_NAME} target=${TARGET_FILE}"
+
+          rm -rf /tmp/infra-release-pr
+          git clone --depth 1 --branch "$INFRA_BASE_BRANCH" \
+            "https://${INFRA_USERNAME}:${INFRA_TOKEN}@${SERVER_HOST}/${INFRA_REPO}.git" \
+            /tmp/infra-release-pr
+
+          cd /tmp/infra-release-pr
+          git config user.name "${INFRA_APP}-release-bot"
+          git config user.email "${INFRA_APP}-release-bot@local"
+          git checkout -b "$BRANCH_NAME"
+
+          if [ ! -d "$(dirname "$TARGET_FILE")" ]; then
+            echo "Infra app directory is missing: $(dirname "$TARGET_FILE")" >&2
+            echo "Create Dashboard Poppy app config before running release-image." >&2
+            exit 1
+          fi
+
+          printf '%s\n' \
+            "# ${IMAGE_DISPLAY_NAME} immutable image reference (non-secret)" \
+            '# Format: <registry>/<owner>/<image>:<tag>@sha256:<digest>' \
+            '# Example:' \
+            "# ${IMAGE_ENV_VAR}=gitea.inanga-sirius.ts.net/jeremie/${INFRA_APP}:v0.1.0@sha256:0123..." \
+            "${IMAGE_ENV_VAR}=${FULL_REF}" \
+            > "$TARGET_FILE"
+
+          if git diff --quiet -- "$TARGET_FILE"; then
+            echo "[infra] no change, skipping PR"
+            exit 0
+          fi
+
+          git add "$TARGET_FILE"
+          git commit -m "poppy/${INFRA_APP}: pin image ${IMAGE_TAG}"
+          git push -u origin "$BRANCH_NAME"
+
+          API_BASE="${SERVER_URL%/}/api/v1"
+          OWNER="${INFRA_REPO%%/*}"
+          REPO="${INFRA_REPO##*/}"
+
+          EXISTING_PR_URL="$({
+            curl -fsS -H "Authorization: token ${INFRA_TOKEN}" \
+              "${API_BASE}/repos/${OWNER}/${REPO}/pulls?state=open" |
+            python3 -c 'import json,sys; b=sys.argv[1]; prs=json.load(sys.stdin); print(next((pr.get("html_url","") for pr in prs if (pr.get("head") or {}).get("ref")==b), ""))' "$BRANCH_NAME"
+          } || true)"
+
+          if [ -n "$EXISTING_PR_URL" ]; then
+            echo "[infra] PR already exists: $EXISTING_PR_URL"
+            exit 0
+          fi
+
+          TITLE="chore(poppy): pin ${INFRA_APP} image ${IMAGE_TAG}"
+          RUN_URL="${SERVER_URL%/}/${REPO_FULL}/actions/runs/${GITHUB_RUN_ID:-}"
+          BODY="$(printf 'Automated update from %s release-image workflow.\n\n- tag: %s\n- immutable image: %s\n- source run: %s' "$IMAGE_DISPLAY_NAME" "$IMAGE_TAG" "$FULL_REF" "$RUN_URL")"
+
+          PR_PAYLOAD="$(python3 -c 'import json,sys; t,h,b,body=sys.argv[1:5]; print(json.dumps({"title":t,"head":h,"base":b,"body":body}))' \
+            "$TITLE" "$BRANCH_NAME" "$INFRA_BASE_BRANCH" "$BODY")"
+
+          PR_URL="$(curl -fsS -X POST \
+            -H "Authorization: token ${INFRA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PR_PAYLOAD" \
+            "${API_BASE}/repos/${OWNER}/${REPO}/pulls" | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])')"
+
+          echo "[infra] created PR: ${PR_URL}"
+
+      - name: Summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          source ./release-image.env
+          {
+            echo "## ${APP_LC} image release"
+            echo ""
+            echo "- Image: \`${IMAGE_REF}\`"
+            echo "- Digest: \`${DIGEST}\`"
+            echo "- Immutable ref: \`${FULL_REF}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

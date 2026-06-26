@@ -2,6 +2,6 @@ version: "0.5"
 
 processes:
   homarr:
-    command: "docker compose up --pull always --remove-orphans"
+    command: "bash -lc '${CONTAINER_COMPOSE:-docker compose} -f ${COMPOSE_FILE:-compose.yml} up --pull always --remove-orphans'"
     availability:
       restart: "on_failure"
